@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.Python
+pip-log.txt
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Claude Code
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Web prototype (superseded by Qt viewer)
+web/
+
+# Project specific
+*.npy
+*.part
+recording*.npy
+*.docx
+*.log
+
+# OpenEB build artifacts (not redistributed)
+*.dll
+*.pyd

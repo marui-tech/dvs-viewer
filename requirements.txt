@@ -1,0 +1,8 @@
+# DVS Viewer — Python dependencies
+# metavision_hal is provided by OpenEB build (not pip-installable)
+# See docs/openeb_install_windows.md for OpenEB installation
+
+PyQt5>=5.15.0
+PyOpenGL>=3.1.6
+numpy>=1.21.0
+opencv-python>=4.5.0
