@@ -1016,7 +1016,7 @@ class MainWindow(QMainWindow):
             self._lbl_fps.setText("FPS: —")
             gray = "font-size:9px;font-weight:bold;color:#8b949e;"
             for attr in ("_p_paint","_p_wait","_p_epf","_p_vbo",
-                         "_p_vsync","_p_orphan","_p_timer","_p_queue"):
+                         "_p_vsync","_p_orphan","_p_timer","_p_batches"):
                 getattr(self, attr).setText("—")
                 getattr(self, attr).setStyleSheet(gray)
         if self._container:
