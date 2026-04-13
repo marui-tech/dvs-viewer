@@ -905,11 +905,12 @@ class MainWindow(QMainWindow):
 
         sv.add(QLabel("事件切片  Event Slice  Δt (µs)"))
         self._spn_dt = QSpinBox()
-        self._spn_dt.setRange(1000, 100_000); self._spn_dt.setValue(10_000)
-        self._spn_dt.setSingleStep(1000)
+        self._spn_dt.setRange(100, 100_000); self._spn_dt.setValue(10_000)
+        self._spn_dt.setSingleStep(100)
         self._spn_dt.valueChanged.connect(lambda v: self.camera.set_delta_t(v))
         sv.add(self._spn_dt)
-        sv.add(_muted("1000µs=1ms → max 1000Hz detection; restart to take effect"))
+        sv.add(_muted("100µs–100ms；高速目标用 instant 模式+调小至 200–500µs；重启采集生效\n"
+                       "High-speed: use instant mode + set 200–500µs; restart to apply"))
 
         btn_clr = QPushButton("🗑 清空帧缓冲  Clear Frame Buffer")
         btn_clr.clicked.connect(self._on_clear)
