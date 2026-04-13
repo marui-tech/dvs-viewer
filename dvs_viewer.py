@@ -733,6 +733,7 @@ class MainWindow(QMainWindow):
         self._render_thr: Optional[RenderThread]    = None
         self._container:  Optional[QWidget]         = None
         self._playback_thr: Optional[PlaybackThread] = None
+        self._pb_camera_was_streaming = False
 
         self._build_ui()
         self._update_buttons()
@@ -1124,6 +1125,9 @@ class MainWindow(QMainWindow):
         pb_btns.addWidget(self._btn_pb_playpause)
         pb_btns.addWidget(self._btn_pb_stop)
         spb.add(pb_btns)
+        hint = QLabel("▲ 画面显示在主窗口中央区域\n   Video renders in the center panel")
+        hint.setStyleSheet("font-size:9px;color:#58a6ff;padding:4px 0 0 0;")
+        spb.add(hint)
 
         hl.addWidget(col4)
 
@@ -1492,6 +1496,15 @@ class MainWindow(QMainWindow):
             self._lbl_pb_status.setStyleSheet("font-size:10px;color:#f85149;")
             return
 
+        # 如果相机正在采集，先停止（避免两路事件混合）
+        self._pb_camera_was_streaming = self.camera.is_streaming
+        if self.camera.is_streaming:
+            try:
+                self.camera.stop()
+                self._update_buttons()
+            except Exception:
+                pass
+
         w = self._spn_pb_w.value()
         h = self._spn_pb_h.value()
         if self._render_thr is None:
@@ -1500,6 +1513,9 @@ class MainWindow(QMainWindow):
             self._lbl_pb_status.setText("⚠ 渲染初始化失败")
             self._lbl_pb_status.setStyleSheet("font-size:10px;color:#f85149;")
             return
+
+        # 清空残留画面，开始全新回放
+        self._render_thr.clear_frame()
 
         speed = 10 ** (self._sld_pb_speed.value() / 20.0 - 4.0)
         self._playback_thr = PlaybackThread(path, self._render_thr)
@@ -1510,7 +1526,7 @@ class MainWindow(QMainWindow):
 
         self._btn_pb_playpause.setText("⏸  暂停  Pause")
         self._btn_pb_stop.setEnabled(True)
-        self._lbl_pb_status.setText("▶ 播放中  Playing")
+        self._lbl_pb_status.setText("▶ 播放中  Playing — 看主窗口中央")
         self._lbl_pb_status.setStyleSheet("font-size:10px;color:#3fb950;")
 
     def _on_pb_stop(self):
@@ -1535,6 +1551,14 @@ class MainWindow(QMainWindow):
         self._stop_playback()
         self._lbl_pb_status.setText("✓ 回放结束  Finished")
         self._lbl_pb_status.setStyleSheet("font-size:10px;color:#8b949e;")
+        # 回放结束，若相机之前在采集则自动恢复
+        if self._pb_camera_was_streaming and self.camera.state.value == "connected":
+            try:
+                self.camera.start()
+                self._update_buttons()
+            except Exception:
+                pass
+        self._pb_camera_was_streaming = False
 
     def closeEvent(self, event):
         self._stop_playback()
