@@ -520,6 +520,8 @@ class PlaybackThread(QThread):
         self._pause_evt  = threading.Event()
         self._pause_evt.set()          # 默认不暂停
         self._stop_flag  = threading.Event()
+        self._seek_ratio: Optional[float] = None   # None=无seek请求，0.0~1.0=跳转目标
+        self._seek_lock  = threading.Lock()
 
     # ── 控制接口（线程安全）──────────────────────────────────────────────────
     def set_speed(self, speed: float):
@@ -535,6 +537,12 @@ class PlaybackThread(QThread):
     @property
     def is_paused(self) -> bool:
         return not self._pause_evt.is_set()
+
+    def seek(self, ratio: float):
+        """跳转到录制的相对位置（0.0=开头，1.0=结尾），线程安全。"""
+        with self._seek_lock:
+            self._seek_ratio = float(np.clip(ratio, 0.0, 1.0))
+        self._pause_evt.set()   # 若暂停中也能立即响应 seek
 
     def stop_playback(self):
         self._stop_flag.set()
@@ -575,6 +583,16 @@ class PlaybackThread(QThread):
             self._pause_evt.wait()
             if self._stop_flag.is_set():
                 break
+
+            # 处理 seek 请求（拖动进度条触发）
+            with self._seek_lock:
+                seek_ratio = self._seek_ratio
+                self._seek_ratio = None
+            if seek_ratio is not None:
+                idx = int(np.clip(seek_ratio * n, 0, n - 1))
+                # seek 后若处于暂停状态，重新设置等待（不自动恢复播放）
+                if not self._pause_evt.is_set():
+                    self._pause_evt.clear()
 
             t0 = time.perf_counter()
 
@@ -1132,12 +1150,13 @@ class MainWindow(QMainWindow):
         spb.add(self._sld_pb_speed)
         spb.add(self._lbl_pb_speed)
 
-        # 进度条 + 时间
-        self._pb_progress = QProgressBar()
+        # 进度条（可拖动 seek）
+        self._pb_progress = QSlider(Qt.Horizontal)
         self._pb_progress.setRange(0, 1000)
         self._pb_progress.setValue(0)
-        self._pb_progress.setTextVisible(False)
-        self._pb_progress.setFixedHeight(10)
+        self._pb_progress.setFixedHeight(16)
+        self._pb_progress.setToolTip("拖动跳转 / Drag to seek")
+        self._pb_progress.sliderMoved.connect(self._on_pb_seek)
         spb.add(self._pb_progress)
         self._lbl_pb_status = QLabel("就绪  Ready")
         self._lbl_pb_status.setStyleSheet("font-size:10px;color:#8b949e;")
@@ -1566,14 +1585,24 @@ class MainWindow(QMainWindow):
             self._playback_thr.stop_playback()
             self._playback_thr.wait(3000)
             self._playback_thr = None
+        self._pb_progress.blockSignals(True)
         self._pb_progress.setValue(0)
+        self._pb_progress.blockSignals(False)
         self._btn_pb_playpause.setText("▶  播放  Play")
         self._btn_pb_stop.setEnabled(False)
         self._lbl_pb_status.setText("就绪  Ready")
         self._lbl_pb_status.setStyleSheet("font-size:10px;color:#8b949e;")
 
+    def _on_pb_seek(self, slider_val: int):
+        """用户拖动进度条时触发。"""
+        if self._playback_thr:
+            self._playback_thr.seek(slider_val / 1000.0)
+
     def _on_pb_progress(self, progress: float, label: str):
+        # blockSignals 防止程序更新进度条时触发 sliderMoved 形成死循环
+        self._pb_progress.blockSignals(True)
         self._pb_progress.setValue(int(progress * 1000))
+        self._pb_progress.blockSignals(False)
         self._lbl_pb_status.setText(f"▶ {label}")
 
     def _on_pb_finished(self):
