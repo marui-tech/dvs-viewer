@@ -311,8 +311,9 @@ class RenderThread(QThread):
                 evs = np.concatenate(pending_list)
 
             # ② 计时：GPU渲染 + buffer swap
+            # instant 模式：每帧强制清除，只显示当前 Δt 切片，无拖尾，适合超高速目标
             _t_paint = time.monotonic()
-            n_evs = self._paint(evs, ww, wh, do_clear)   # _paint 返回实际渲染事件数
+            n_evs = self._paint(evs, ww, wh, do_clear or self.viz_mode == "instant")
             self._ctx.swapBuffers(self._window)
             paint_ms = (time.monotonic() - _t_paint) * 1000.0
 
@@ -771,6 +772,7 @@ class MainWindow(QMainWindow):
         "on_only":      "仅ON Only ON — 只显示亮度增加事件/brightness-increase events",
         "off_only":     "仅OFF Only OFF — 只显示亮度降低事件/brightness-decrease events",
         "accumulated":  "累积 Accumulated — 不衰减,按清空重置/no decay, clear to reset",
+        "instant":      "瞬时帧 Instant — 每帧清除,只显示当前Δt切片/clear per frame, no trail. 高速目标推荐↓Δt至1-2ms",
     }
 
     def __init__(self):
@@ -886,7 +888,7 @@ class MainWindow(QMainWindow):
         sv.add(QLabel("模式  Mode"))
         self._cmb_viz = QComboBox()
         self._cmb_viz.addItems(["event_frame", "time_surface", "on_only",
-                                 "off_only", "accumulated"])
+                                 "off_only", "accumulated", "instant"])
         self._cmb_viz.currentTextChanged.connect(self._on_viz_mode)
         sv.add(self._cmb_viz)
         self._lbl_viz_desc = _muted("")
