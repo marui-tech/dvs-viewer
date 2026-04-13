@@ -1454,9 +1454,11 @@ class MainWindow(QMainWindow):
     _BIAS_PRESETS = {
         "default":  {"bias_fo": 72, "bias_hpf":  0, "bias_diff_on":  98,
                      "bias_diff": 77, "bias_diff_off": 49, "bias_refr": 20},
-        # refr=0 最大重复触发率；低阈值提高灵敏度；ERC 建议关闭或调高
-        "fast":     {"bias_fo": 72, "bias_hpf":  0, "bias_diff_on":  75,
-                     "bias_diff": 65, "bias_diff_off": 35, "bias_refr":  0},
+        # 高速目标关键参数：refr=0（最小不应期，像素可高频重复触发）
+        # diff_on/diff/diff_off 保持 ≥15 单位间距，避免 IMX636 像素电路不稳定
+        # diff_on=88, diff=72, diff_off=44：间距 16/28，略低于默认提升灵敏度
+        "fast":     {"bias_fo": 72, "bias_hpf":  0, "bias_diff_on":  88,
+                     "bias_diff": 72, "bias_diff_off": 44, "bias_refr":  0},
         # 高 refr + 高阈值：抑制噪声，适合低速静态场景长时录制
         "lownoise": {"bias_fo": 72, "bias_hpf": 20, "bias_diff_on": 130,
                      "bias_diff": 90, "bias_diff_off": 90, "bias_refr": 80},
