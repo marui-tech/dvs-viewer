@@ -35,7 +35,7 @@ from PyQt5.QtWidgets import (
     QPushButton, QLabel, QComboBox, QSlider, QGroupBox,
     QSplitter, QScrollArea, QSizePolicy, QSpinBox, QFrame,
     QCheckBox, QLineEdit, QDoubleSpinBox, QFormLayout, QTabWidget,
-    QLayout,
+    QLayout, QProgressBar, QFileDialog,
 )
 from PyQt5.QtCore  import Qt, QTimer, QThread, pyqtSignal
 from PyQt5.QtGui   import QOpenGLContext, QWindow, QPalette, QColor, QSurfaceFormat
@@ -469,6 +469,123 @@ def _muted(text: str) -> QLabel:
 
 
 # ─── CollapsibleSection ────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PlaybackThread — .npy 文件回放，支持 0.0001x～10x 速度
+# ═══════════════════════════════════════════════════════════════════════════════
+class PlaybackThread(QThread):
+    """从 .npy 事件文件回放事件，将事件批次推送给 RenderThread.push_events()。
+
+    速度模型：
+      每帧推进 dt_us = frame_interval * speed * 1e6 微秒的事件时间。
+      显示帧率固定在 TARGET_FPS（60fps）；speed 仅影响每帧"消费"多少事件时间。
+      speed=1.0  → 实时回放
+      speed=0.0001 → 每帧推进 1µs，等效 10000x 慢放，可看到最细粒度事件
+      speed=10.0  → 快进 10x
+    """
+
+    progress_updated = pyqtSignal(float, str)   # (0~1, "当前/总 s")
+    finished         = pyqtSignal()
+
+    TARGET_FPS = 60
+
+    def __init__(self, npy_path: str, render_thr, parent=None):
+        super().__init__(parent)
+        self._path       = npy_path
+        self._render_thr = render_thr
+        self._speed      = 1.0
+        self._speed_lock = threading.Lock()
+        self._pause_evt  = threading.Event()
+        self._pause_evt.set()          # 默认不暂停
+        self._stop_flag  = threading.Event()
+
+    # ── 控制接口（线程安全）──────────────────────────────────────────────────
+    def set_speed(self, speed: float):
+        with self._speed_lock:
+            self._speed = max(1e-4, speed)
+
+    def pause(self):
+        self._pause_evt.clear()
+
+    def resume(self):
+        self._pause_evt.set()
+
+    @property
+    def is_paused(self) -> bool:
+        return not self._pause_evt.is_set()
+
+    def stop_playback(self):
+        self._stop_flag.set()
+        self._pause_evt.set()   # 解除暂停阻塞，让 run() 能退出
+
+    # ── 主循环 ───────────────────────────────────────────────────────────────
+    def run(self):
+        try:
+            evs = np.load(self._path, allow_pickle=True)
+        except Exception as e:
+            print(f"[Playback] 加载失败: {e}")
+            self.finished.emit()
+            return
+
+        if len(evs) == 0:
+            self.finished.emit()
+            return
+
+        # 确保按时间戳升序排列
+        t_all = evs['t'].astype(np.int64)
+        if not np.all(t_all[:-1] <= t_all[1:]):
+            order = np.argsort(t_all, kind='stable')
+            evs   = evs[order]
+            t_all = t_all[order]
+
+        t_min       = int(t_all[0])
+        t_max       = int(t_all[-1])
+        duration_us = max(1, t_max - t_min)
+        n           = len(evs)
+        frame_s     = 1.0 / self.TARGET_FPS
+
+        idx = 0
+        while not self._stop_flag.is_set() and idx < n:
+            self._pause_evt.wait()
+            if self._stop_flag.is_set():
+                break
+
+            t0 = time.perf_counter()
+
+            with self._speed_lock:
+                speed = self._speed
+
+            # 本帧推进多少微秒的事件时间
+            dt_us   = max(1, int(frame_s * speed * 1_000_000))
+            t_cur   = int(t_all[idx])
+            t_next  = t_cur + dt_us
+            end_idx = int(np.searchsorted(t_all, t_next, side='left'))
+            end_idx = min(end_idx, n)
+
+            batch = evs[idx:end_idx]
+            if len(batch) > 0:
+                self._render_thr.push_events(batch)
+
+            idx = end_idx
+
+            # 进度信号
+            progress = (t_cur - t_min) / duration_us
+            cur_s    = (t_cur - t_min) / 1_000_000
+            total_s  = duration_us / 1_000_000
+            self.progress_updated.emit(
+                float(np.clip(progress, 0, 1)),
+                f"{cur_s:.2f}s / {total_s:.2f}s  ×{speed:.4g}"
+            )
+
+            # 睡眠至下一帧
+            elapsed = time.perf_counter() - t0
+            rem = frame_s - elapsed
+            if rem > 0:
+                time.sleep(rem)
+
+        self.progress_updated.emit(1.0, "回放结束 Finished")
+        self.finished.emit()
+
+
 class CollapsibleSection(QWidget):
     """
     可折叠区块：标题栏显示中英双语，点击展开/折叠内容区。
@@ -615,6 +732,7 @@ class MainWindow(QMainWindow):
         self._render_win: Optional[DVSRenderWindow] = None
         self._render_thr: Optional[RenderThread]    = None
         self._container:  Optional[QWidget]         = None
+        self._playback_thr: Optional[PlaybackThread] = None
 
         self._build_ui()
         self._update_buttons()
@@ -949,6 +1067,70 @@ class MainWindow(QMainWindow):
                                 "border-radius:4px;")
         srec.add(code_lbl)
 
+        # 回放 Playback
+        spb = col4.section("回放", "Playback")
+        spb.add(_muted("从 .npy 录制文件回放  Playback from .npy recording"))
+
+        # 文件选择
+        pb_file_row = QHBoxLayout()
+        self._txt_pb_path = QLineEdit("recording.npy")
+        btn_pb_browse = QPushButton("📂")
+        btn_pb_browse.setFixedWidth(28)
+        btn_pb_browse.clicked.connect(self._on_pb_browse)
+        pb_file_row.addWidget(self._txt_pb_path)
+        pb_file_row.addWidget(btn_pb_browse)
+        spb.add(pb_file_row)
+
+        # 传感器尺寸（.npy 不含分辨率信息，需手动填）
+        pb_sz_row = QHBoxLayout()
+        pb_sz_row.addWidget(QLabel("W"))
+        self._spn_pb_w = QSpinBox(); self._spn_pb_w.setRange(1, 9999); self._spn_pb_w.setValue(1280)
+        pb_sz_row.addWidget(self._spn_pb_w)
+        pb_sz_row.addWidget(QLabel("H"))
+        self._spn_pb_h = QSpinBox(); self._spn_pb_h.setRange(1, 9999); self._spn_pb_h.setValue(720)
+        pb_sz_row.addWidget(self._spn_pb_h)
+        spb.add(pb_sz_row)
+        spb.add(_muted("IMX636 默认 1280×720"))
+
+        # 速度滑块：对数刻度 0.0001x (10000x慢) ~ 10x 快进
+        # slider 0→100 : speed = 10^(slider/20 - 4)
+        # slider=0  → 0.0001x   slider=80 → 1.0x   slider=100 → 10x
+        spb.add(QLabel("速度  Speed"))
+        self._sld_pb_speed = QSlider(Qt.Horizontal)
+        self._sld_pb_speed.setRange(0, 100)
+        self._sld_pb_speed.setValue(80)   # 1x
+        self._lbl_pb_speed = QLabel("×1.0 实时")
+        self._lbl_pb_speed.setStyleSheet("font-size:10px;font-weight:bold;color:#58a6ff;")
+        self._sld_pb_speed.valueChanged.connect(self._on_pb_speed)
+        spb.add(self._sld_pb_speed)
+        spb.add(self._lbl_pb_speed)
+
+        # 进度条
+        self._pb_progress = QProgressBar()
+        self._pb_progress.setRange(0, 1000)
+        self._pb_progress.setValue(0)
+        self._pb_progress.setTextVisible(False)
+        self._pb_progress.setFixedHeight(6)
+        self._lbl_pb_time = QLabel("—")
+        self._lbl_pb_time.setStyleSheet("font-size:10px;color:#8b949e;")
+        spb.add(self._pb_progress)
+        spb.add(self._lbl_pb_time)
+
+        # 控制按钮
+        pb_btns = QHBoxLayout()
+        self._btn_pb_play  = QPushButton("▶ 播放  Play")
+        self._btn_pb_pause = QPushButton("⏸ 暂停  Pause")
+        self._btn_pb_stop  = QPushButton("⏹ 停止  Stop")
+        self._btn_pb_pause.setEnabled(False)
+        self._btn_pb_stop.setEnabled(False)
+        self._btn_pb_play.clicked.connect(self._on_pb_play)
+        self._btn_pb_pause.clicked.connect(self._on_pb_pause)
+        self._btn_pb_stop.clicked.connect(self._on_pb_stop)
+        pb_btns.addWidget(self._btn_pb_play)
+        pb_btns.addWidget(self._btn_pb_pause)
+        pb_btns.addWidget(self._btn_pb_stop)
+        spb.add(pb_btns)
+
         hl.addWidget(col4)
 
     # ── 相机操作 ───────────────────────────────────────────────────────────────
@@ -1266,7 +1448,97 @@ class MainWindow(QMainWindow):
         self._btn_stop.setEnabled(s == "streaming")
         self._btn_disc.setEnabled(s in ("connected", "streaming"))
 
+    # ── 回放 Playback ──────────────────────────────────────────────────────────
+    def _on_pb_browse(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择录制文件 Select recording", "", "NumPy (*.npy)")
+        if path:
+            self._txt_pb_path.setText(path)
+
+    def _on_pb_speed(self, val: int):
+        speed = 10 ** (val / 20.0 - 4.0)
+        if speed >= 1.0:
+            label = f"×{speed:.3g} {'快进 Fast' if speed > 1.0 else '实时 1:1'}"
+        elif speed >= 0.001:
+            label = f"×{speed:.4g}  ({1/speed:.0f}x 慢)"
+        else:
+            label = f"×{speed:.2e}  ({1/speed:.0f}x 慢)"
+        self._lbl_pb_speed.setText(label)
+        if self._playback_thr:
+            self._playback_thr.set_speed(speed)
+
+    def _on_pb_play(self):
+        # 如果已在回放且是暂停状态 → 恢复
+        if self._playback_thr and self._playback_thr.is_paused:
+            self._playback_thr.resume()
+            self._btn_pb_play.setEnabled(False)
+            self._btn_pb_pause.setEnabled(True)
+            return
+
+        # 停止旧的回放
+        self._stop_playback()
+
+        path = self._txt_pb_path.text().strip()
+        if not path:
+            return
+
+        w = self._spn_pb_w.value()
+        h = self._spn_pb_h.value()
+
+        # 启动渲染窗口（如果还没有）
+        if self._render_thr is None:
+            self._start_render(w, h)
+        if self._render_thr is None:
+            return
+
+        speed = 10 ** (self._sld_pb_speed.value() / 20.0 - 4.0)
+
+        self._playback_thr = PlaybackThread(path, self._render_thr)
+        self._playback_thr.set_speed(speed)
+        self._playback_thr.progress_updated.connect(self._on_pb_progress)
+        self._playback_thr.finished.connect(self._on_pb_finished)
+        self._playback_thr.start()
+
+        self._btn_pb_play.setEnabled(False)
+        self._btn_pb_pause.setEnabled(True)
+        self._btn_pb_stop.setEnabled(True)
+
+    def _on_pb_pause(self):
+        if not self._playback_thr:
+            return
+        if self._playback_thr.is_paused:
+            self._playback_thr.resume()
+            self._btn_pb_pause.setText("⏸ 暂停  Pause")
+            self._btn_pb_play.setEnabled(False)
+        else:
+            self._playback_thr.pause()
+            self._btn_pb_pause.setText("▶ 继续  Resume")
+            self._btn_pb_play.setEnabled(False)
+
+    def _on_pb_stop(self):
+        self._stop_playback()
+
+    def _stop_playback(self):
+        if self._playback_thr:
+            self._playback_thr.stop_playback()
+            self._playback_thr.wait(3000)
+            self._playback_thr = None
+        self._pb_progress.setValue(0)
+        self._lbl_pb_time.setText("—")
+        self._btn_pb_play.setEnabled(True)
+        self._btn_pb_pause.setEnabled(False)
+        self._btn_pb_pause.setText("⏸ 暂停  Pause")
+        self._btn_pb_stop.setEnabled(False)
+
+    def _on_pb_progress(self, progress: float, label: str):
+        self._pb_progress.setValue(int(progress * 1000))
+        self._lbl_pb_time.setText(label)
+
+    def _on_pb_finished(self):
+        self._stop_playback()
+
     def closeEvent(self, event):
+        self._stop_playback()
         self._stop_render()
         self.camera.disconnect()
         super().closeEvent(event)
