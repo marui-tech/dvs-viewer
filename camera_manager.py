@@ -96,6 +96,10 @@ class CameraManager:
         self._rec_queue   : Optional[_queue.Queue]     = None   # None = 未录制
         self._rec_io_thr  : Optional[threading.Thread] = None
         self._rec_lock    = threading.Lock()
+        # 录制过滤器（采集线程读，主线程写，GIL 保证赋值原子性）
+        self._rec_roi     : Optional[tuple] = None   # (x0,y0,x1,y1) or None=全帧
+        self._rec_keep_1in: int             = 1      # 保留 1/N 事件（1=全量）
+        self._rec_skip_n  : int             = 0      # 内部计数器
 
         # 统计
         self._total_events    = 0
@@ -333,11 +337,24 @@ class CameraManager:
                             # 录制：非阻塞投入 IO 队列，不再阻塞采集线程
                             q = self._rec_queue   # GIL 保证原子读
                             if q is not None:
-                                try:
-                                    q.put_nowait(evs)
-                                    self._rec_total += len(evs)
-                                except _queue.Full:
-                                    pass  # IO 线程跟不上：丢弃本帧，保持采集不卡顿
+                                batch = evs
+                                # ① ROI 过滤
+                                roi = self._rec_roi
+                                if roi is not None:
+                                    x0, y0, x1, y1 = roi
+                                    m = ((batch['x'] >= x0) & (batch['x'] < x1) &
+                                         (batch['y'] >= y0) & (batch['y'] < y1))
+                                    batch = batch[m]
+                                # ② 密度抽样（每 N 个取 1 个，保持时间顺序）
+                                n = self._rec_keep_1in
+                                if n > 1 and len(batch) > 0:
+                                    batch = batch[::n]
+                                if len(batch) > 0:
+                                    try:
+                                        q.put_nowait(batch)
+                                        self._rec_total += len(batch)
+                                    except _queue.Full:
+                                        pass  # IO 跟不上：丢弃本帧，采集不卡顿
                 else:
                     time.sleep(0.0005)  # 0.5ms，避免空转
 
@@ -522,6 +539,18 @@ class CameraManager:
                 self._f_trig_out.enable(False)
         except Exception as e:
             raise CameraError(f"Trigger Out 设置失败: {e}")
+
+    # ── Recording filters ────────────────────────────────────────────────────
+    def set_rec_roi(self, enabled: bool,
+                    x0: int = 0, y0: int = 0,
+                    x1: int = 1280, y1: int = 720):
+        """录制 ROI 过滤：仅保存指定矩形内的事件，大幅缩小文件体积。"""
+        self._rec_roi = (int(x0), int(y0), int(x1), int(y1)) if enabled else None
+
+    def set_rec_decimation(self, keep_1in: int):
+        """录制密度抽样：每 N 个事件保留 1 个（1=全量，2=1/2，4=1/4…）。"""
+        self._rec_keep_1in = max(1, int(keep_1in))
+        self._rec_skip_n   = 0
 
     # ── Recording ────────────────────────────────────────────────────────────
     def start_recording(self, path: str):

@@ -915,6 +915,20 @@ class MainWindow(QMainWindow):
 
         # 偏置调节 Bias Tuning (默认折叠)
         sb = col2.section("偏置调节", "Bias Tuning", expanded=False)
+
+        # 快速预设
+        sb.add(_muted("快速预设  Quick Presets"))
+        preset_row = QHBoxLayout()
+        for label, method in [("默认", self._on_bias_preset_default),
+                               ("高速目标", self._on_bias_preset_fast),
+                               ("低噪声", self._on_bias_preset_lownoise)]:
+            b = QPushButton(label)
+            b.setFixedHeight(22)
+            b.setStyleSheet("font-size:10px;padding:2px;")
+            b.clicked.connect(method)
+            preset_row.addWidget(b)
+        sb.add(preset_row)
+
         self._bias_sliders: dict = {}
         self._bias_labels:  dict = {}
         for bname, bmeta in BIAS_DEFS.items():
@@ -1107,6 +1121,53 @@ class MainWindow(QMainWindow):
         srec.add(QLabel("路径  Path"))
         self._txt_rec_path = QLineEdit("recording.npy")
         srec.add(self._txt_rec_path)
+        # ── 录制 ROI 过滤 ──────────────────────────────────────────────────────
+        self._chk_rec_roi = QCheckBox("区域过滤  ROI Filter")
+        self._chk_rec_roi.setToolTip(
+            "只录制指定矩形内的事件，大幅缩小文件\n"
+            "Only record events inside the rectangle")
+        self._chk_rec_roi.toggled.connect(self._on_rec_roi_changed)
+        srec.add(self._chk_rec_roi)
+
+        roi_r1 = QHBoxLayout()
+        roi_r1.addWidget(_muted("X0"))
+        self._spn_rec_x0 = QSpinBox(); self._spn_rec_x0.setRange(0, 9999); self._spn_rec_x0.setValue(0)
+        roi_r1.addWidget(self._spn_rec_x0)
+        roi_r1.addWidget(_muted("Y0"))
+        self._spn_rec_y0 = QSpinBox(); self._spn_rec_y0.setRange(0, 9999); self._spn_rec_y0.setValue(0)
+        roi_r1.addWidget(self._spn_rec_y0)
+        srec.add(roi_r1)
+
+        roi_r2 = QHBoxLayout()
+        roi_r2.addWidget(_muted("X1"))
+        self._spn_rec_x1 = QSpinBox(); self._spn_rec_x1.setRange(1, 9999); self._spn_rec_x1.setValue(1280)
+        roi_r2.addWidget(self._spn_rec_x1)
+        roi_r2.addWidget(_muted("Y1"))
+        self._spn_rec_y1 = QSpinBox(); self._spn_rec_y1.setRange(1, 9999); self._spn_rec_y1.setValue(720)
+        roi_r2.addWidget(self._spn_rec_y1)
+        srec.add(roi_r2)
+
+        for spn in (self._spn_rec_x0, self._spn_rec_y0,
+                    self._spn_rec_x1, self._spn_rec_y1):
+            spn.valueChanged.connect(self._on_rec_roi_changed)
+
+        btn_sync_roi = QPushButton("↑ 同步相机 ROI  Sync from Camera ROI")
+        btn_sync_roi.setStyleSheet("font-size:10px;")
+        btn_sync_roi.clicked.connect(self._on_rec_roi_sync)
+        srec.add(btn_sync_roi)
+
+        # ── 录制密度 ────────────────────────────────────────────────────────
+        srec.add(_muted("录制密度  Rec. Density  (保留 1/N 个事件)"))
+        density_row = QHBoxLayout()
+        density_row.addWidget(_muted("1/N:"))
+        self._cmb_rec_density = QComboBox()
+        for label, n in [("全量 ×1", 1), ("1/2", 2), ("1/4", 4),
+                          ("1/8", 8), ("1/16", 16)]:
+            self._cmb_rec_density.addItem(label, n)
+        self._cmb_rec_density.currentIndexChanged.connect(self._on_rec_density_changed)
+        density_row.addWidget(self._cmb_rec_density)
+        srec.add(density_row)
+
         self._btn_rec_start = QPushButton("⏺ 开始录制  Start Recording")
         self._btn_rec_start.clicked.connect(self._on_rec_start)
         self._btn_rec_stop  = QPushButton("⏹ 停止录制  Stop Recording")
@@ -1389,6 +1450,37 @@ class MainWindow(QMainWindow):
         for name, meta in BIAS_DEFS.items():
             self._bias_sliders[name].setValue(meta["default"])
 
+    # 偏置预设值
+    _BIAS_PRESETS = {
+        "default":  {"bias_fo": 72, "bias_hpf":  0, "bias_diff_on":  98,
+                     "bias_diff": 77, "bias_diff_off": 49, "bias_refr": 20},
+        # refr=0 最大重复触发率；低阈值提高灵敏度；ERC 建议关闭或调高
+        "fast":     {"bias_fo": 72, "bias_hpf":  0, "bias_diff_on":  75,
+                     "bias_diff": 65, "bias_diff_off": 35, "bias_refr":  0},
+        # 高 refr + 高阈值：抑制噪声，适合低速静态场景长时录制
+        "lownoise": {"bias_fo": 72, "bias_hpf": 20, "bias_diff_on": 130,
+                     "bias_diff": 90, "bias_diff_off": 90, "bias_refr": 80},
+    }
+
+    def _apply_bias_preset(self, key: str):
+        p = self._BIAS_PRESETS[key]
+        for name, val in p.items():
+            if name in self._bias_sliders:
+                self._bias_sliders[name].setValue(val)  # 触发 _on_bias → 写硬件
+
+    def _on_bias_preset_default(self):
+        self._apply_bias_preset("default")
+
+    def _on_bias_preset_fast(self):
+        """高速目标预设：最小不应期 + 低阈值 + 建议关闭 ERC。"""
+        self._apply_bias_preset("fast")
+        # 自动关闭 ERC，避免高速目标事件被硬件丢弃
+        self._chk_erc.setChecked(False)
+        self._on_erc_apply()
+
+    def _on_bias_preset_lownoise(self):
+        self._apply_bias_preset("lownoise")
+
     # ── ERC ────────────────────────────────────────────────────────────────────
     def _on_erc_apply(self):
         try:
@@ -1473,6 +1565,29 @@ class MainWindow(QMainWindow):
             self._mon_timer.start()
         else:
             self._mon_timer.stop()
+
+    # ── Recording filters ──────────────────────────────────────────────────────
+    def _on_rec_roi_changed(self):
+        enabled = self._chk_rec_roi.isChecked()
+        self.camera.set_rec_roi(
+            enabled,
+            self._spn_rec_x0.value(), self._spn_rec_y0.value(),
+            self._spn_rec_x1.value(), self._spn_rec_y1.value(),
+        )
+
+    def _on_rec_roi_sync(self):
+        """将相机 ROI 的坐标复制到录制 ROI。"""
+        roi = self.camera.get_roi()
+        if roi.get("enabled"):
+            self._spn_rec_x0.setValue(roi["x"])
+            self._spn_rec_y0.setValue(roi["y"])
+            self._spn_rec_x1.setValue(roi["x"] + roi["width"])
+            self._spn_rec_y1.setValue(roi["y"] + roi["height"])
+            self._chk_rec_roi.setChecked(True)
+
+    def _on_rec_density_changed(self):
+        n = self._cmb_rec_density.currentData()
+        self.camera.set_rec_decimation(n if n else 1)
 
     # ── Recording ──────────────────────────────────────────────────────────────
     def _on_rec_start(self):
