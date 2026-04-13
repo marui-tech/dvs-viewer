@@ -1472,30 +1472,44 @@ class MainWindow(QMainWindow):
 
     def _on_bias_preset_default(self):
         self._apply_bias_preset("default")
-        # 恢复 ERC 至默认 5 Mev/s，防止切回后仍满屏
         self._chk_erc.setChecked(True)
         self._spn_erc_thresh.setValue(5_000_000)
         self._on_erc_apply()
+        # 关闭 Activity Filter（恢复默认状态）
+        self._chk_act.setChecked(False)
+        self._on_act_apply()
         if self._render_thr:
             self._render_thr.clear_frame()
 
     def _on_bias_preset_fast(self):
-        """高速目标预设：最小不应期 + 低阈值 + ERC 放宽到 20 Mev/s。
-        不完全关 ERC——IMX636 关 ERC 后最高 66 Mev/s 会淹没渲染线程导致满屏白。
-        20 Mev/s 是 4x 默认值，足以捕捉快速目标而不饱和。"""
+        """高速目标预设：
+        - bias_refr=0：最小不应期，允许像素高频触发
+        - ERC 20 Mev/s：4x 默认，不完全关（关掉会 66 Mev/s 淹没渲染）
+        - Activity Filter 上限 500K ev/s/px：过滤热像素
+          热像素以 MHz 速率触发 → 方块噪音；真实运动像素 < 500K/s → 保留
+        """
         self._apply_bias_preset("fast")
         self._chk_erc.setChecked(True)
         self._spn_erc_thresh.setValue(20_000_000)
         self._on_erc_apply()
+        # 关键：启用 Activity Filter 抑制热像素（方块噪音的根源）
+        self._chk_act.setChecked(True)
+        self._spn_act_lower.setValue(0)
+        self._spn_act_upper.setValue(500_000)
+        self._on_act_apply()
         if self._render_thr:
             self._render_thr.clear_frame()
 
     def _on_bias_preset_lownoise(self):
         self._apply_bias_preset("lownoise")
-        # 低噪声场景：收紧 ERC 到 2 Mev/s，减少渲染负载
         self._chk_erc.setChecked(True)
         self._spn_erc_thresh.setValue(2_000_000)
         self._on_erc_apply()
+        # 低噪声：活动滤波双向收紧（去除静止噪声和热像素）
+        self._chk_act.setChecked(True)
+        self._spn_act_lower.setValue(50)
+        self._spn_act_upper.setValue(2_000_000)
+        self._on_act_apply()
 
     # ── ERC ────────────────────────────────────────────────────────────────────
     def _on_erc_apply(self):
