@@ -225,11 +225,12 @@ class RenderThread(QThread):
 
     def push_events_fresh(self, evs: np.ndarray):
         """回放专用：先清除 FBO 再渲染，每个时间窗口独立显示，消除衰减闪烁。
-        即使 evs 为空也触发清除（显示当前时间窗口为空）。"""
+        空帧时保留画面（不清除），避免慢放时因事件稀疏导致的黑屏闪烁。"""
+        if len(evs) == 0:
+            return
         with self._pending_lock:
             self._do_clear = True
-            if len(evs) > 0:
-                self._pending_list.append(evs)
+            self._pending_list.append(evs)
         self._new_evt.set()
 
     def clear_frame(self):
