@@ -506,7 +506,7 @@ class PlaybackThread(QThread):
       speed=10.0  → 快进 10x
     """
 
-    progress_updated = pyqtSignal(float, str)   # (0~1, "当前/总 s")
+    progress_updated = pyqtSignal(float, float, float)  # (ratio 0~1, cur_s, total_s)
     finished         = pyqtSignal()
 
     TARGET_FPS = 60
@@ -617,8 +617,7 @@ class PlaybackThread(QThread):
             cur_s    = (t_cur - t_min) / 1_000_000
             total_s  = duration_us / 1_000_000
             self.progress_updated.emit(
-                float(np.clip(progress, 0, 1)),
-                f"{cur_s:.2f}s / {total_s:.2f}s  ×{speed:.4g}"
+                float(np.clip(progress, 0, 1)), cur_s, total_s
             )
 
             # 睡眠至下一帧
@@ -629,7 +628,7 @@ class PlaybackThread(QThread):
 
         # 恢复原始可视化模式
         self._render_thr.viz_mode = orig_viz
-        self.progress_updated.emit(1.0, "回放结束 Finished")
+        self.progress_updated.emit(1.0, total_s, total_s)
         self.finished.emit()
 
 
@@ -794,10 +793,17 @@ class MainWindow(QMainWindow):
     def _build_ui(self):
         root = QWidget(self)
         self.setCentralWidget(root)
-        hl = QHBoxLayout(root)
+        vl = QVBoxLayout(root)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(0)
+
+        # 主体：四列面板 + 渲染区
+        main_w = QWidget()
+        hl = QHBoxLayout(main_w)
         hl.setContentsMargins(0, 0, 0, 0)
         hl.setSpacing(0)
         self._main_hl = hl
+        vl.addWidget(main_w, 1)
 
         # ── Column 1: 相机 / Camera ──────────────────────────────────────────
         col1 = ColumnPanel("相机", "Camera", 215)
@@ -1150,34 +1156,90 @@ class MainWindow(QMainWindow):
         spb.add(self._sld_pb_speed)
         spb.add(self._lbl_pb_speed)
 
-        # 进度条（可拖动 seek）
-        self._pb_progress = QSlider(Qt.Horizontal)
-        self._pb_progress.setRange(0, 1000)
-        self._pb_progress.setValue(0)
-        self._pb_progress.setFixedHeight(16)
-        self._pb_progress.setToolTip("拖动跳转 / Drag to seek")
-        self._pb_progress.sliderMoved.connect(self._on_pb_seek)
-        spb.add(self._pb_progress)
-        self._lbl_pb_status = QLabel("就绪  Ready")
-        self._lbl_pb_status.setStyleSheet("font-size:10px;color:#8b949e;")
-        spb.add(self._lbl_pb_status)
-
-        # 两个按钮：播放/暂停切换 + 停止
-        pb_btns = QHBoxLayout()
-        self._btn_pb_playpause = QPushButton("▶  播放  Play")
-        self._btn_pb_playpause.setStyleSheet("font-size:12px;padding:4px;")
-        self._btn_pb_stop = QPushButton("⏹  停止  Stop")
-        self._btn_pb_stop.setEnabled(False)
-        self._btn_pb_playpause.clicked.connect(self._on_pb_playpause)
-        self._btn_pb_stop.clicked.connect(self._on_pb_stop)
-        pb_btns.addWidget(self._btn_pb_playpause)
-        pb_btns.addWidget(self._btn_pb_stop)
-        spb.add(pb_btns)
-        hint = QLabel("▲ 画面显示在主窗口中央区域\n   Video renders in the center panel")
+        # 一键载入并播放
+        self._btn_pb_load = QPushButton("▶  载入并播放  Load & Play")
+        self._btn_pb_load.setStyleSheet("font-size:12px;padding:6px;")
+        self._btn_pb_load.clicked.connect(self._on_pb_load)
+        spb.add(self._btn_pb_load)
+        hint = QLabel("▲ 播放控制栏出现在窗口底部\n   Controls appear at the bottom")
         hint.setStyleSheet("font-size:9px;color:#58a6ff;padding:4px 0 0 0;")
         spb.add(hint)
 
         hl.addWidget(col4)
+
+        # VLC 风格播放底栏（播放时显示，默认隐藏）
+        self._pb_bar = self._build_playback_bar()
+        vl.addWidget(self._pb_bar)
+        self._pb_bar.hide()
+
+    # ── VLC 风格播放底栏 ────────────────────────────────────────────────────────
+    def _build_playback_bar(self) -> QWidget:
+        bar = QWidget()
+        bar.setFixedHeight(58)
+        bar.setStyleSheet(
+            "background:#1c2128; border-top:1px solid #30363d;")
+
+        vl = QVBoxLayout(bar)
+        vl.setContentsMargins(10, 5, 10, 5)
+        vl.setSpacing(3)
+
+        # ── 进度条（全宽可拖动）──────────────────────────────────────────────
+        self._pb_seekbar = QSlider(Qt.Horizontal)
+        self._pb_seekbar.setRange(0, 10000)
+        self._pb_seekbar.setValue(0)
+        self._pb_seekbar.setToolTip("拖动跳转 / Drag to seek")
+        self._pb_seekbar.sliderMoved.connect(self._on_pb_seek)
+        self._pb_seekbar.setStyleSheet(
+            "QSlider::groove:horizontal{height:4px;background:#30363d;border-radius:2px;}"
+            "QSlider::sub-page:horizontal{background:#58a6ff;border-radius:2px;}"
+            "QSlider::handle:horizontal{width:12px;height:12px;margin:-4px 0;"
+            "background:#58a6ff;border-radius:6px;}")
+        vl.addWidget(self._pb_seekbar)
+
+        # ── 控制行 ────────────────────────────────────────────────────────────
+        ctrl = QHBoxLayout()
+        ctrl.setContentsMargins(0, 0, 0, 0)
+        ctrl.setSpacing(6)
+
+        def _bar_btn(text, w=32):
+            b = QPushButton(text)
+            b.setFixedSize(w, 26)
+            b.setStyleSheet(
+                "QPushButton{background:#21262d;border:1px solid #30363d;"
+                "border-radius:4px;color:#e6edf3;font-size:13px;}"
+                "QPushButton:hover{background:#30363d;}"
+                "QPushButton:pressed{background:#161b22;}")
+            return b
+
+        self._btn_pb_restart   = _bar_btn("⏮", 28)
+        self._btn_pb_playpause = _bar_btn("▶", 36)
+        self._btn_pb_stop      = _bar_btn("⏹", 28)
+        self._btn_pb_restart.setToolTip("回到开头 / Go to start")
+        self._btn_pb_playpause.setToolTip("播放/暂停 / Play/Pause")
+        self._btn_pb_stop.setToolTip("停止并关闭 / Stop")
+        self._btn_pb_restart.clicked.connect(self._on_pb_restart)
+        self._btn_pb_playpause.clicked.connect(self._on_pb_toggle)
+        self._btn_pb_stop.clicked.connect(self._on_pb_stop)
+
+        self._lbl_pb_time = QLabel("0:00 / 0:00")
+        self._lbl_pb_time.setStyleSheet(
+            "font-size:11px;color:#e6edf3;font-family:Consolas,monospace;")
+        self._lbl_pb_time.setFixedWidth(100)
+
+        self._lbl_pb_speed_display = QLabel("× 1.0")
+        self._lbl_pb_speed_display.setStyleSheet(
+            "font-size:11px;color:#58a6ff;font-weight:bold;")
+        self._lbl_pb_speed_display.setFixedWidth(72)
+        self._lbl_pb_speed_display.setToolTip("在左侧面板调节速度 / Adjust speed in left panel")
+
+        ctrl.addWidget(self._btn_pb_restart)
+        ctrl.addWidget(self._btn_pb_playpause)
+        ctrl.addWidget(self._btn_pb_stop)
+        ctrl.addStretch()
+        ctrl.addWidget(self._lbl_pb_time)
+        ctrl.addWidget(self._lbl_pb_speed_display)
+        vl.addLayout(ctrl)
+        return bar
 
     # ── 相机操作 ───────────────────────────────────────────────────────────────
     def _on_connect(self):
@@ -1512,39 +1574,29 @@ class MainWindow(QMainWindow):
         else:
             label = f"× {speed:.1e}  ({round(1/speed):,}x 慢放 Slow)"
         self._lbl_pb_speed.setText(label)
+        # 同步更新底栏速度显示
+        if speed >= 2.0:
+            spd_str = f"× {speed:.0f}"
+        elif speed >= 0.9:
+            spd_str = "× 1.0"
+        else:
+            spd_str = f"× {speed:.1e}"
+        self._lbl_pb_speed_display.setText(spd_str)
         if self._playback_thr:
             self._playback_thr.set_speed(speed)
 
-    def _on_pb_playpause(self):
-        # 正在播放 → 暂停
-        if self._playback_thr and not self._playback_thr.is_paused:
-            self._playback_thr.pause()
-            self._btn_pb_playpause.setText("▶  继续  Resume")
-            self._lbl_pb_status.setText("⏸ 已暂停  Paused")
-            self._lbl_pb_status.setStyleSheet("font-size:10px;color:#e3b341;")
-            return
-
-        # 已暂停 → 继续
-        if self._playback_thr and self._playback_thr.is_paused:
-            self._playback_thr.resume()
-            self._btn_pb_playpause.setText("⏸  暂停  Pause")
-            self._lbl_pb_status.setText("▶ 播放中  Playing")
-            self._lbl_pb_status.setStyleSheet("font-size:10px;color:#3fb950;")
-            return
-
-        # 全新开始
+    def _on_pb_load(self):
+        """载入文件并开始播放（col4 按钮）。"""
         path = self._txt_pb_path.text().strip()
         if not path:
-            self._lbl_pb_status.setText("⚠ 请先点击📂选择文件")
-            self._lbl_pb_status.setStyleSheet("font-size:10px;color:#f85149;")
+            self._btn_pb_load.setText("⚠ 请先选择文件")
             return
         import os as _os
         if not _os.path.isfile(path):
-            self._lbl_pb_status.setText(f"⚠ 文件不存在: {path}")
-            self._lbl_pb_status.setStyleSheet("font-size:10px;color:#f85149;")
+            self._btn_pb_load.setText(f"⚠ 文件不存在")
             return
 
-        # 如果相机正在采集，先停止（避免两路事件混合）
+        # 如果相机正在采集，先停止
         self._pb_camera_was_streaming = self.camera.is_streaming
         if self.camera.is_streaming:
             try:
@@ -1558,11 +1610,9 @@ class MainWindow(QMainWindow):
         if self._render_thr is None:
             self._start_render(w, h)
         if self._render_thr is None:
-            self._lbl_pb_status.setText("⚠ 渲染初始化失败")
-            self._lbl_pb_status.setStyleSheet("font-size:10px;color:#f85149;")
+            self._btn_pb_load.setText("⚠ 渲染初始化失败")
             return
 
-        # 清空残留画面，开始全新回放
         self._render_thr.clear_frame()
 
         speed = 10 ** (self._sld_pb_speed.value() / 20.0 - 4.0)
@@ -1572,10 +1622,27 @@ class MainWindow(QMainWindow):
         self._playback_thr.finished.connect(self._on_pb_finished)
         self._playback_thr.start()
 
-        self._btn_pb_playpause.setText("⏸  暂停  Pause")
-        self._btn_pb_stop.setEnabled(True)
-        self._lbl_pb_status.setText("▶ 播放中  Playing — 看主窗口中央")
-        self._lbl_pb_status.setStyleSheet("font-size:10px;color:#3fb950;")
+        # 显示底部播放栏
+        self._pb_bar.show()
+        self._btn_pb_playpause.setText("⏸")
+        self._btn_pb_load.setText("▶  载入并播放  Load & Play")
+
+    def _on_pb_toggle(self):
+        """底栏播放/暂停切换。"""
+        if not self._playback_thr:
+            return
+        if not self._playback_thr.is_paused:
+            self._playback_thr.pause()
+            self._btn_pb_playpause.setText("▶")
+        else:
+            self._playback_thr.resume()
+            self._btn_pb_playpause.setText("⏸")
+
+    def _on_pb_restart(self):
+        """底栏回到开头。"""
+        if self._playback_thr:
+            self._playback_thr.seek(0.0)
+            self._btn_pb_playpause.setText("⏸")
 
     def _on_pb_stop(self):
         self._stop_playback()
@@ -1585,30 +1652,31 @@ class MainWindow(QMainWindow):
             self._playback_thr.stop_playback()
             self._playback_thr.wait(3000)
             self._playback_thr = None
-        self._pb_progress.blockSignals(True)
-        self._pb_progress.setValue(0)
-        self._pb_progress.blockSignals(False)
-        self._btn_pb_playpause.setText("▶  播放  Play")
-        self._btn_pb_stop.setEnabled(False)
-        self._lbl_pb_status.setText("就绪  Ready")
-        self._lbl_pb_status.setStyleSheet("font-size:10px;color:#8b949e;")
+        self._pb_seekbar.blockSignals(True)
+        self._pb_seekbar.setValue(0)
+        self._pb_seekbar.blockSignals(False)
+        self._lbl_pb_time.setText("0:00 / 0:00")
+        self._btn_pb_playpause.setText("▶")
+        self._pb_bar.hide()
 
     def _on_pb_seek(self, slider_val: int):
-        """用户拖动进度条时触发。"""
+        """用户拖动底栏进度条时触发。"""
         if self._playback_thr:
-            self._playback_thr.seek(slider_val / 1000.0)
+            self._playback_thr.seek(slider_val / 10000.0)
 
-    def _on_pb_progress(self, progress: float, label: str):
-        # blockSignals 防止程序更新进度条时触发 sliderMoved 形成死循环
-        self._pb_progress.blockSignals(True)
-        self._pb_progress.setValue(int(progress * 1000))
-        self._pb_progress.blockSignals(False)
-        self._lbl_pb_status.setText(f"▶ {label}")
+    def _on_pb_progress(self, progress: float, cur_s: float, total_s: float):
+        # 更新底栏进度条（blockSignals 防止触发 sliderMoved 死循环）
+        self._pb_seekbar.blockSignals(True)
+        self._pb_seekbar.setValue(int(progress * 10000))
+        self._pb_seekbar.blockSignals(False)
+        # 时间标签
+        def fmt(s: float) -> str:
+            s = int(s)
+            return f"{s//60}:{s%60:02d}"
+        self._lbl_pb_time.setText(f"{fmt(cur_s)} / {fmt(total_s)}")
 
     def _on_pb_finished(self):
         self._stop_playback()
-        self._lbl_pb_status.setText("✓ 回放结束  Finished")
-        self._lbl_pb_status.setStyleSheet("font-size:10px;color:#8b949e;")
         # 回放结束，若相机之前在采集则自动恢复
         if self._pb_camera_was_streaming and self.camera.state.value == "connected":
             try:
