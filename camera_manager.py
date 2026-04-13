@@ -10,6 +10,9 @@ DVS Camera Manager — OpenEB HAL 封装
 import threading
 import time
 import enum
+import struct as _struct
+import shutil
+import queue  as _queue
 import numpy as np
 from typing import Optional, Dict, Any
 import os, sys
@@ -39,8 +42,12 @@ BIAS_DEFS: Dict[str, Dict] = {
     "bias_refr":     {"default": 20,  "min": 0,   "max": 255, "desc": "不应期（越大事件率越低）"},
 }
 
-# 录制：每积累多少个切片就刷写一次磁盘，避免 _rec_chunks 无限增长占满内存
-RECORD_FLUSH_EVERY = 200
+# 录制 IO 队列大小：采集线程最多预存多少个 10ms 切片再开始丢弃
+# 200 × 10ms = 2s 缓冲；IO 线程跟不上时丢弃新帧而非阻塞采集线程
+_REC_QUEUE_MAX = 200
+
+# DVS 事件结构体 dtype（与 dvs_viewer.py 一致）
+_EVT_DTYPE = np.dtype([('x','<u2'),('y','<u2'),('p','<i2'),('t','<i8')])
 
 
 class CameraState(str, enum.Enum):
@@ -82,12 +89,13 @@ class CameraManager:
         self._capture_thr: Optional[threading.Thread] = None
         self._delta_t_us  = 10_000   # 事件切片时间窗口（µs），默认 10ms
 
-        # 录制（保存为 .npy）
-        self._rec_path:    Optional[str]  = None
-        self._rec_chunks:  Optional[list] = None
-        self._rec_tmpfile: Optional[str]  = None
-        self._rec_total:   int            = 0
-        self._rec_lock = threading.Lock()
+        # 录制（IO 线程解耦磁盘写入，采集线程只做非阻塞 queue.put_nowait）
+        self._rec_path    : Optional[str]              = None
+        self._rec_tmpfile : Optional[str]              = None
+        self._rec_total   : int                        = 0
+        self._rec_queue   : Optional[_queue.Queue]     = None   # None = 未录制
+        self._rec_io_thr  : Optional[threading.Thread] = None
+        self._rec_lock    = threading.Lock()
 
         # 统计
         self._total_events    = 0
@@ -210,19 +218,31 @@ class CameraManager:
         with self._lock:
             if self._state == CameraState.STREAMING:
                 self._do_stop()
+            # 中止正在进行的录制（不等待完整写入，临时文件随后清理）
             with self._rec_lock:
-                self._rec_chunks  = None
+                q     = self._rec_queue
+                io_thr = self._rec_io_thr
+                tmp    = self._rec_tmpfile
+                self._rec_queue   = None
+                self._rec_io_thr  = None
                 self._rec_path    = None
-                self._rec_total   = 0
-                if self._rec_tmpfile and os.path.exists(self._rec_tmpfile):
-                    try: os.remove(self._rec_tmpfile)
-                    except Exception: pass
                 self._rec_tmpfile = None
+                self._rec_total   = 0
             self._device = None
-            self._state = CameraState.DISCONNECTED
+            self._state  = CameraState.DISCONNECTED
             self._f_biases = self._f_erc = self._f_roi = None
             self._f_monitoring = self._f_aflicker = self._f_actfilter = None
             self._f_trig_in = self._f_trig_out = None
+
+        # 锁外：停止 IO 线程，清理临时文件
+        if q is not None:
+            try: q.put_nowait(None)
+            except Exception: pass
+        if io_thr and io_thr.is_alive():
+            io_thr.join(timeout=3)
+        if tmp and os.path.exists(tmp):
+            try: os.remove(tmp)
+            except Exception: pass
 
     # ─────────────────────────────── 流控 ───────────────────────────────────
     def start(self):
@@ -310,11 +330,14 @@ class CameraManager:
                         accum.clear()
                         if len(evs) > 0:
                             self._update_stats(evs)
-                            with self._rec_lock:
-                                if self._rec_chunks is not None:
-                                    self._rec_chunks.append(evs.copy())
-                                    if len(self._rec_chunks) >= RECORD_FLUSH_EVERY:
-                                        self._flush_rec_chunks()
+                            # 录制：非阻塞投入 IO 队列，不再阻塞采集线程
+                            q = self._rec_queue   # GIL 保证原子读
+                            if q is not None:
+                                try:
+                                    q.put_nowait(evs)
+                                    self._rec_total += len(evs)
+                                except _queue.Full:
+                                    pass  # IO 线程跟不上：丢弃本帧，保持采集不卡顿
                 else:
                     time.sleep(0.0005)  # 0.5ms，避免空转
 
@@ -503,54 +526,92 @@ class CameraManager:
     # ── Recording ────────────────────────────────────────────────────────────
     def start_recording(self, path: str):
         with self._rec_lock:
-            if self._rec_chunks is not None:
+            if self._rec_queue is not None:
                 raise CameraError("录制已在进行中")
             self._rec_path    = path
-            self._rec_chunks  = []
-            self._rec_tmpfile = path + ".part"
+            self._rec_tmpfile = path + ".tmp"
             self._rec_total   = 0
             if os.path.exists(self._rec_tmpfile):
                 os.remove(self._rec_tmpfile)
+            self._rec_queue  = _queue.Queue(maxsize=_REC_QUEUE_MAX)
+            self._rec_io_thr = threading.Thread(
+                target=self._rec_io_loop, daemon=True, name="RecIO")
+            self._rec_io_thr.start()
 
-    def _flush_rec_chunks(self):
-        """将当前缓冲切片追加写入磁盘（必须持 _rec_lock 调用）."""
-        if not self._rec_chunks:
-            return
-        batch = np.concatenate(self._rec_chunks)
-        self._rec_chunks.clear()
-        self._rec_total += len(batch)
-        tmp = self._rec_tmpfile
-        if os.path.exists(tmp):
-            prev = np.load(tmp, allow_pickle=True)
-            batch = np.concatenate([prev, batch])
-        np.save(tmp, batch)
+    def _rec_io_loop(self):
+        """IO 线程：从队列读取事件批，以原始字节追加写入临时文件。
+        采集线程不再阻塞于磁盘 I/O，彻底消除录制导致的采集滞后。"""
+        q       = self._rec_queue    # 本地引用，stop_recording 置 None 后仍有效
+        tmpfile = self._rec_tmpfile
+        try:
+            with open(tmpfile, 'ab') as f:
+                while True:
+                    try:
+                        item = q.get(timeout=0.5)
+                    except _queue.Empty:
+                        continue
+                    if item is None:   # 哨兵：退出信号
+                        break
+                    f.write(item.tobytes())
+        except Exception as e:
+            print(f"[RecIO] 写入失败: {e}")
+
+    def _binary_to_npy(self, binary_path: str, npy_path: str):
+        """将原始二进制事件流（结构体逐字节堆叠）转换为 .npy，
+        流式拷贝：O(1) 内存，无需将整个文件读入 RAM。"""
+        file_size = os.path.getsize(binary_path)
+        n = file_size // _EVT_DTYPE.itemsize
+        # 手工写 NumPy 1.0 格式头（避免为 n 个事件分配内存）
+        descr = _EVT_DTYPE.descr   # [('x','<u2'), ...]
+        hdr   = (f"{{'descr': {descr!r}, "
+                 f"'fortran_order': False, "
+                 f"'shape': ({n},), }}")
+        # 头部块需是 64 字节的整数倍（magic 6 + version 2 + hlen 2 = 10 字节前缀）
+        pad = (64 - (10 + len(hdr) + 1) % 64) % 64
+        hdr += ' ' * pad + '\n'
+        with open(npy_path, 'wb') as fout:
+            fout.write(b'\x93NUMPY\x01\x00')
+            fout.write(_struct.pack('<H', len(hdr)))
+            fout.write(hdr.encode('latin1'))
+            with open(binary_path, 'rb') as fin:
+                shutil.copyfileobj(fin, fout, 4 * 1024 * 1024)
 
     def stop_recording(self) -> Dict[str, Any]:
         with self._rec_lock:
-            if self._rec_chunks is None:
+            if self._rec_queue is None:
                 raise CameraError("未在录制")
-            self._flush_rec_chunks()
-            path    = self._rec_path
-            total   = self._rec_total
-            tmp     = self._rec_tmpfile
-            self._rec_chunks  = None
+            q      = self._rec_queue
+            io_thr = self._rec_io_thr
+            path   = self._rec_path
+            tmp    = self._rec_tmpfile
+            total  = self._rec_total
+            self._rec_queue   = None
+            self._rec_io_thr  = None
             self._rec_path    = None
             self._rec_tmpfile = None
             self._rec_total   = 0
 
+        # 锁外：发送哨兵，等待 IO 线程将剩余数据写完
+        q.put(None)
+        if io_thr:
+            io_thr.join(timeout=30)
+
         try:
-            if tmp and os.path.exists(tmp):
-                os.replace(tmp, path)
-            elif total == 0:
-                np.save(path, np.array([], dtype=[('x','<u2'),('y','<u2'),('p','<i2'),('t','<i8')]))
+            if total == 0 or not os.path.exists(tmp):
+                np.save(path, np.array([], dtype=_EVT_DTYPE))
+            else:
+                self._binary_to_npy(tmp, path)
             return {"path": path, "events": total}
         except Exception as e:
             raise CameraError(f"保存录制失败: {e}")
+        finally:
+            if tmp and os.path.exists(tmp):
+                try: os.remove(tmp)
+                except Exception: pass
 
     @property
     def is_recording(self) -> bool:
-        with self._rec_lock:
-            return self._rec_chunks is not None
+        return self._rec_queue is not None
 
     # ── 综合状态 ─────────────────────────────────────────────────────────────
     def get_status(self) -> Dict[str, Any]:

@@ -218,9 +218,12 @@ class RenderThread(QThread):
     # ── 公共 API（线程安全）────────────────────────────────────────────────────
     def push_events(self, evs: np.ndarray):
         """从 capture 线程直接调用。
-        累积所有 USB 包到列表，渲染帧一次性消费全部，消除原有 95%+ 事件丢弃。"""
+        累积所有 USB 包到列表，渲染帧一次性消费全部，消除原有 95%+ 事件丢弃。
+        设置上限（60批）：渲染线程偶尔落后时丢弃最旧的帧，保持画面实时。"""
         with self._pending_lock:
             self._pending_list.append(evs)
+            if len(self._pending_list) > 60:
+                self._pending_list = self._pending_list[-30:]
         self._new_evt.set()
 
     def push_events_fresh(self, evs: np.ndarray):
@@ -1244,25 +1247,39 @@ class MainWindow(QMainWindow):
 
     # ── 相机操作 ───────────────────────────────────────────────────────────────
     def _on_connect(self):
-        try:
-            info = self.camera.connect()
+        """连接相机（在工作线程执行，避免 HAL open + 重试期间冻结 UI）。"""
+        self._btn_conn.setEnabled(False)
+        self._btn_conn.setText("⚡ 连接中…  Connecting…")
+
+        class _ConnWorker(QThread):
+            result = pyqtSignal(object, object)  # (info_dict | None, error | None)
+            def __init__(self, cam): super().__init__(); self._cam = cam
+            def run(self):
+                try:    self.result.emit(self._cam.connect(), None)
+                except Exception as e: self.result.emit(None, e)
+
+        def _on_done(info, err):
+            self._btn_conn.setText("⚡ 连接相机  Connect")
+            self._btn_conn.setEnabled(True)
+            if err:
+                self._lbl_state.setText(f"连接失败: {err}")
+                return
             w, h = info["width"], info["height"]
             self._lbl_serial.setText(f"序列号: {info.get('serial','—')}")
             self._lbl_res.setText(f"分辨率: {w}×{h}")
-            # Facilities 可用性
             fac = info.get("facilities", {})
             enabled = [k for k, v in fac.items() if v]
             self._lbl_fac.setText("Facilities:\n" + ("  ".join(enabled) if enabled else "—"))
-            # ROI 默认大小
             self._spn_roi_w.setValue(w); self._spn_roi_h.setValue(h)
-            # IMX636：连接后自动启用 ERC（5 Mev/s），防止高事件率压垮渲染线程
             if fac.get("erc"):
                 self._chk_erc.setChecked(True)
                 self._on_erc_apply()
             self._start_render(w, h)
             self._update_buttons()
-        except Exception as e:
-            self._lbl_state.setText(f"连接失败: {e}")
+
+        self._connect_worker = _ConnWorker(self.camera)
+        self._connect_worker.result.connect(_on_done)
+        self._connect_worker.start()
 
     def _start_render(self, w: int, h: int):
         """创建渲染窗口和渲染线程，替换中央占位区域 / Replace center placeholder."""
@@ -1472,18 +1489,33 @@ class MainWindow(QMainWindow):
             self._lbl_rec_result.setStyleSheet("font-size:11px;color:#f85149;")
 
     def _on_rec_stop(self):
-        try:
-            result = self.camera.stop_recording()
+        """停止录制并在工作线程中完成 IO + npy 转换，避免大文件时冻结 UI。"""
+        self._btn_rec_stop.setEnabled(False)
+        self._lbl_rec_result.setText("💾 保存中…  Saving…")
+        self._lbl_rec_result.setStyleSheet("font-size:11px;color:#e3b341;")
+
+        class _RecStopWorker(QThread):
+            done = pyqtSignal(object, object)
+            def __init__(self, cam): super().__init__(); self._cam = cam
+            def run(self):
+                try:    self.done.emit(self._cam.stop_recording(), None)
+                except Exception as e: self.done.emit(None, e)
+
+        def _on_done(result, err):
             self._btn_rec_start.setEnabled(True)
-            self._btn_rec_stop.setEnabled(False)
+            self._lbl_rec_status.setText("录制: 未录制")
+            if err:
+                self._lbl_rec_result.setText(f"✗ {err}")
+                self._lbl_rec_result.setStyleSheet("font-size:11px;color:#f85149;")
+                return
             events = result.get("events", 0)
-            path   = result.get("path",   "")
+            path   = result.get("path", "")
             self._lbl_rec_result.setText(f"✓ 已保存 {events:,} 个事件\n→ {path}")
             self._lbl_rec_result.setStyleSheet("font-size:11px;color:#3fb950;")
-            self._lbl_rec_status.setText("录制: 未录制")
-        except Exception as e:
-            self._lbl_rec_result.setText(f"✗ {e}")
-            self._lbl_rec_result.setStyleSheet("font-size:11px;color:#f85149;")
+
+        self._rec_stop_worker = _RecStopWorker(self.camera)
+        self._rec_stop_worker.done.connect(_on_done)
+        self._rec_stop_worker.start()
 
     # ── 渲染性能回调（每秒一次，来自 RenderThread）────────────────────────────
     def _on_perf(self, d: dict):
