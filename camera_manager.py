@@ -518,13 +518,30 @@ class CameraManager:
     def set_trigger_in(self, channel: int, enabled: bool):
         if not self._f_trig_in:
             raise CameraError("Trigger In 不支持")
+        # HAL 的 enable()/disable() 需要 I_TriggerIn.Channel 枚举，不能直接传 int
+        ch = self._trig_in_channel(channel)
         try:
             if enabled:
-                self._f_trig_in.enable(channel)
+                self._f_trig_in.enable(ch)
             else:
-                self._f_trig_in.disable(channel)
+                self._f_trig_in.disable(ch)
         except Exception as e:
             raise CameraError(f"Trigger In 设置失败: {e}")
+
+    def _trig_in_channel(self, channel: int):
+        """将 int channel 转换为 HAL 所需的 I_TriggerIn.Channel 枚举。"""
+        # pybind11 绑定通常通过 type(facility).Channel 暴露枚举
+        try:
+            return type(self._f_trig_in).Channel(channel)
+        except (AttributeError, ValueError):
+            pass
+        # 备选：metavision_hal 模块直接导入
+        try:
+            from metavision_hal import I_TriggerIn
+            return I_TriggerIn.Channel(channel)
+        except Exception:
+            pass
+        return channel  # 最后回退：原样传入，让 HAL 报错
 
     def set_trigger_out(self, enabled: bool, period_us: int = 1_000_000,
                         duty: float = 0.5):

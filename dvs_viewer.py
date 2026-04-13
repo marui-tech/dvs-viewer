@@ -1470,16 +1470,30 @@ class MainWindow(QMainWindow):
 
     def _on_bias_preset_default(self):
         self._apply_bias_preset("default")
+        # 恢复 ERC 至默认 5 Mev/s，防止切回后仍满屏
+        self._chk_erc.setChecked(True)
+        self._spn_erc_thresh.setValue(5_000_000)
+        self._on_erc_apply()
+        if self._render_thr:
+            self._render_thr.clear_frame()
 
     def _on_bias_preset_fast(self):
-        """高速目标预设：最小不应期 + 低阈值 + 建议关闭 ERC。"""
+        """高速目标预设：最小不应期 + 低阈值 + ERC 放宽到 20 Mev/s。
+        不完全关 ERC——IMX636 关 ERC 后最高 66 Mev/s 会淹没渲染线程导致满屏白。
+        20 Mev/s 是 4x 默认值，足以捕捉快速目标而不饱和。"""
         self._apply_bias_preset("fast")
-        # 自动关闭 ERC，避免高速目标事件被硬件丢弃
-        self._chk_erc.setChecked(False)
+        self._chk_erc.setChecked(True)
+        self._spn_erc_thresh.setValue(20_000_000)
         self._on_erc_apply()
+        if self._render_thr:
+            self._render_thr.clear_frame()
 
     def _on_bias_preset_lownoise(self):
         self._apply_bias_preset("lownoise")
+        # 低噪声场景：收紧 ERC 到 2 Mev/s，减少渲染负载
+        self._chk_erc.setChecked(True)
+        self._spn_erc_thresh.setValue(2_000_000)
+        self._on_erc_apply()
 
     # ── ERC ────────────────────────────────────────────────────────────────────
     def _on_erc_apply(self):
