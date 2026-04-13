@@ -1921,6 +1921,45 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
 
+    # 全局控件样式：面板 body 用 stylesheet 硬设深色背景后，子控件无法从 Palette 继承
+    # 文字颜色，需在 setStyleSheet 中显式指定输入类控件的前景/背景色
+    app.setStyleSheet("""
+        QSpinBox, QDoubleSpinBox {
+            color: #e6edf3;
+            background: #21262d;
+            border: 1px solid #30363d;
+            border-radius: 3px;
+            padding: 2px 4px;
+        }
+        QSpinBox:disabled, QDoubleSpinBox:disabled { color: #484f58; }
+        QLineEdit {
+            color: #e6edf3;
+            background: #21262d;
+            border: 1px solid #30363d;
+            border-radius: 3px;
+            padding: 2px 4px;
+        }
+        QLineEdit:disabled { color: #484f58; }
+        QComboBox {
+            color: #e6edf3;
+            background: #21262d;
+            border: 1px solid #30363d;
+            border-radius: 3px;
+            padding: 2px 6px;
+        }
+        QComboBox QAbstractItemView {
+            color: #e6edf3;
+            background: #21262d;
+            selection-background-color: #1f6feb;
+            selection-color: #ffffff;
+        }
+        QCheckBox { color: #e6edf3; }
+        QGroupBox { color: #e6edf3; border: 1px solid #30363d;
+                    border-radius: 4px; margin-top: 6px; padding-top: 4px; }
+        QGroupBox::title { subcontrol-origin: margin; left: 8px; }
+        QLabel { color: #e6edf3; }
+    """)
+
     pal = QPalette()
     pal.setColor(QPalette.Window,          QColor(22, 27, 34))
     pal.setColor(QPalette.WindowText,      QColor(230, 237, 243))
