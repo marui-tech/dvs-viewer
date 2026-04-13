@@ -1069,65 +1069,59 @@ class MainWindow(QMainWindow):
 
         # 回放 Playback
         spb = col4.section("回放", "Playback")
-        spb.add(_muted("从 .npy 录制文件回放  Playback from .npy recording"))
 
         # 文件选择
         pb_file_row = QHBoxLayout()
-        self._txt_pb_path = QLineEdit("recording.npy")
-        btn_pb_browse = QPushButton("📂")
-        btn_pb_browse.setFixedWidth(28)
+        self._txt_pb_path = QLineEdit()
+        self._txt_pb_path.setPlaceholderText("点击📂选择 .npy 文件…")
+        self._txt_pb_path.setReadOnly(True)
+        btn_pb_browse = QPushButton("📂 选择文件")
         btn_pb_browse.clicked.connect(self._on_pb_browse)
         pb_file_row.addWidget(self._txt_pb_path)
         pb_file_row.addWidget(btn_pb_browse)
         spb.add(pb_file_row)
 
-        # 传感器尺寸（.npy 不含分辨率信息，需手动填）
+        # 传感器尺寸
         pb_sz_row = QHBoxLayout()
-        pb_sz_row.addWidget(QLabel("W"))
+        pb_sz_row.addWidget(_muted("传感器 W"))
         self._spn_pb_w = QSpinBox(); self._spn_pb_w.setRange(1, 9999); self._spn_pb_w.setValue(1280)
         pb_sz_row.addWidget(self._spn_pb_w)
-        pb_sz_row.addWidget(QLabel("H"))
+        pb_sz_row.addWidget(_muted("H"))
         self._spn_pb_h = QSpinBox(); self._spn_pb_h.setRange(1, 9999); self._spn_pb_h.setValue(720)
         pb_sz_row.addWidget(self._spn_pb_h)
         spb.add(pb_sz_row)
-        spb.add(_muted("IMX636 默认 1280×720"))
 
-        # 速度滑块：对数刻度 0.0001x (10000x慢) ~ 10x 快进
-        # slider 0→100 : speed = 10^(slider/20 - 4)
-        # slider=0  → 0.0001x   slider=80 → 1.0x   slider=100 → 10x
-        spb.add(QLabel("速度  Speed"))
+        # 速度滑块：对数刻度  slider=0→0.0001x  slider=80→1x  slider=100→10x
+        spb.add(QLabel("回放速度  Playback Speed"))
         self._sld_pb_speed = QSlider(Qt.Horizontal)
         self._sld_pb_speed.setRange(0, 100)
-        self._sld_pb_speed.setValue(80)   # 1x
-        self._lbl_pb_speed = QLabel("×1.0 实时")
-        self._lbl_pb_speed.setStyleSheet("font-size:10px;font-weight:bold;color:#58a6ff;")
+        self._sld_pb_speed.setValue(80)
+        self._lbl_pb_speed = QLabel("× 1.0  实时")
+        self._lbl_pb_speed.setStyleSheet("font-size:11px;font-weight:bold;color:#58a6ff;")
         self._sld_pb_speed.valueChanged.connect(self._on_pb_speed)
         spb.add(self._sld_pb_speed)
         spb.add(self._lbl_pb_speed)
 
-        # 进度条
+        # 进度条 + 时间
         self._pb_progress = QProgressBar()
         self._pb_progress.setRange(0, 1000)
         self._pb_progress.setValue(0)
         self._pb_progress.setTextVisible(False)
-        self._pb_progress.setFixedHeight(6)
-        self._lbl_pb_time = QLabel("—")
-        self._lbl_pb_time.setStyleSheet("font-size:10px;color:#8b949e;")
+        self._pb_progress.setFixedHeight(10)
         spb.add(self._pb_progress)
-        spb.add(self._lbl_pb_time)
+        self._lbl_pb_status = QLabel("就绪  Ready")
+        self._lbl_pb_status.setStyleSheet("font-size:10px;color:#8b949e;")
+        spb.add(self._lbl_pb_status)
 
-        # 控制按钮
+        # 两个按钮：播放/暂停切换 + 停止
         pb_btns = QHBoxLayout()
-        self._btn_pb_play  = QPushButton("▶ 播放  Play")
-        self._btn_pb_pause = QPushButton("⏸ 暂停  Pause")
-        self._btn_pb_stop  = QPushButton("⏹ 停止  Stop")
-        self._btn_pb_pause.setEnabled(False)
+        self._btn_pb_playpause = QPushButton("▶  播放  Play")
+        self._btn_pb_playpause.setStyleSheet("font-size:12px;padding:4px;")
+        self._btn_pb_stop = QPushButton("⏹  停止  Stop")
         self._btn_pb_stop.setEnabled(False)
-        self._btn_pb_play.clicked.connect(self._on_pb_play)
-        self._btn_pb_pause.clicked.connect(self._on_pb_pause)
+        self._btn_pb_playpause.clicked.connect(self._on_pb_playpause)
         self._btn_pb_stop.clicked.connect(self._on_pb_stop)
-        pb_btns.addWidget(self._btn_pb_play)
-        pb_btns.addWidget(self._btn_pb_pause)
+        pb_btns.addWidget(self._btn_pb_playpause)
         pb_btns.addWidget(self._btn_pb_stop)
         spb.add(pb_btns)
 
@@ -1457,63 +1451,67 @@ class MainWindow(QMainWindow):
 
     def _on_pb_speed(self, val: int):
         speed = 10 ** (val / 20.0 - 4.0)
-        if speed >= 1.0:
-            label = f"×{speed:.3g} {'快进 Fast' if speed > 1.0 else '实时 1:1'}"
+        if speed >= 2.0:
+            label = f"× {speed:.3g}  快进 Fast-forward"
+        elif speed >= 0.9:
+            label = f"× 1.0  实时 Real-time"
         elif speed >= 0.001:
-            label = f"×{speed:.4g}  ({1/speed:.0f}x 慢)"
+            label = f"× {speed:.4g}  ({round(1/speed)}x 慢放 Slow)"
         else:
-            label = f"×{speed:.2e}  ({1/speed:.0f}x 慢)"
+            label = f"× {speed:.1e}  ({round(1/speed):,}x 慢放 Slow)"
         self._lbl_pb_speed.setText(label)
         if self._playback_thr:
             self._playback_thr.set_speed(speed)
 
-    def _on_pb_play(self):
-        # 如果已在回放且是暂停状态 → 恢复
-        if self._playback_thr and self._playback_thr.is_paused:
-            self._playback_thr.resume()
-            self._btn_pb_play.setEnabled(False)
-            self._btn_pb_pause.setEnabled(True)
+    def _on_pb_playpause(self):
+        # 正在播放 → 暂停
+        if self._playback_thr and not self._playback_thr.is_paused:
+            self._playback_thr.pause()
+            self._btn_pb_playpause.setText("▶  继续  Resume")
+            self._lbl_pb_status.setText("⏸ 已暂停  Paused")
+            self._lbl_pb_status.setStyleSheet("font-size:10px;color:#e3b341;")
             return
 
-        # 停止旧的回放
-        self._stop_playback()
+        # 已暂停 → 继续
+        if self._playback_thr and self._playback_thr.is_paused:
+            self._playback_thr.resume()
+            self._btn_pb_playpause.setText("⏸  暂停  Pause")
+            self._lbl_pb_status.setText("▶ 播放中  Playing")
+            self._lbl_pb_status.setStyleSheet("font-size:10px;color:#3fb950;")
+            return
 
+        # 全新开始
         path = self._txt_pb_path.text().strip()
         if not path:
+            self._lbl_pb_status.setText("⚠ 请先点击📂选择文件")
+            self._lbl_pb_status.setStyleSheet("font-size:10px;color:#f85149;")
+            return
+        import os as _os
+        if not _os.path.isfile(path):
+            self._lbl_pb_status.setText(f"⚠ 文件不存在: {path}")
+            self._lbl_pb_status.setStyleSheet("font-size:10px;color:#f85149;")
             return
 
         w = self._spn_pb_w.value()
         h = self._spn_pb_h.value()
-
-        # 启动渲染窗口（如果还没有）
         if self._render_thr is None:
             self._start_render(w, h)
         if self._render_thr is None:
+            self._lbl_pb_status.setText("⚠ 渲染初始化失败")
+            self._lbl_pb_status.setStyleSheet("font-size:10px;color:#f85149;")
             return
 
         speed = 10 ** (self._sld_pb_speed.value() / 20.0 - 4.0)
-
         self._playback_thr = PlaybackThread(path, self._render_thr)
         self._playback_thr.set_speed(speed)
         self._playback_thr.progress_updated.connect(self._on_pb_progress)
         self._playback_thr.finished.connect(self._on_pb_finished)
         self._playback_thr.start()
 
-        self._btn_pb_play.setEnabled(False)
-        self._btn_pb_pause.setEnabled(True)
+        self._btn_pb_playpause.setText("⏸  暂停  Pause")
         self._btn_pb_stop.setEnabled(True)
-
-    def _on_pb_pause(self):
-        if not self._playback_thr:
-            return
-        if self._playback_thr.is_paused:
-            self._playback_thr.resume()
-            self._btn_pb_pause.setText("⏸ 暂停  Pause")
-            self._btn_pb_play.setEnabled(False)
-        else:
-            self._playback_thr.pause()
-            self._btn_pb_pause.setText("▶ 继续  Resume")
-            self._btn_pb_play.setEnabled(False)
+        self._lbl_pb_status.setText("▶ 播放中  Playing")
+        self._lbl_pb_status.setStyleSheet("font-size:10px;color:#3fb950;")
 
     def _on_pb_stop(self):
         self._stop_playback()
@@ -1524,18 +1522,19 @@ class MainWindow(QMainWindow):
             self._playback_thr.wait(3000)
             self._playback_thr = None
         self._pb_progress.setValue(0)
-        self._lbl_pb_time.setText("—")
-        self._btn_pb_play.setEnabled(True)
-        self._btn_pb_pause.setEnabled(False)
-        self._btn_pb_pause.setText("⏸ 暂停  Pause")
+        self._btn_pb_playpause.setText("▶  播放  Play")
         self._btn_pb_stop.setEnabled(False)
+        self._lbl_pb_status.setText("就绪  Ready")
+        self._lbl_pb_status.setStyleSheet("font-size:10px;color:#8b949e;")
 
     def _on_pb_progress(self, progress: float, label: str):
         self._pb_progress.setValue(int(progress * 1000))
-        self._lbl_pb_time.setText(label)
+        self._lbl_pb_status.setText(f"▶ {label}")
 
     def _on_pb_finished(self):
         self._stop_playback()
+        self._lbl_pb_status.setText("✓ 回放结束  Finished")
+        self._lbl_pb_status.setStyleSheet("font-size:10px;color:#8b949e;")
 
     def closeEvent(self, event):
         self._stop_playback()
