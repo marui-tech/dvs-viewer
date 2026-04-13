@@ -1379,7 +1379,9 @@ class MainWindow(QMainWindow):
         if self._render_thr:
             self.camera.remove_event_callback(self._render_thr.push_events)
             self._render_thr.stop_render()
-            self._render_thr.wait(3000)
+            if not self._render_thr.wait(2000):   # 超时则强制终止
+                self._render_thr.terminate()
+                self._render_thr.wait(500)
             self._render_thr = None
             # 清空性能面板
             self._lbl_fps.setText("FPS: —")
@@ -1865,9 +1867,34 @@ class MainWindow(QMainWindow):
         self._pb_camera_was_streaming = False
 
     def closeEvent(self, event):
+        # ① 立即停止轮询，防止清理期间再触发相机访问
+        self._poll.stop()
+
+        # ② 停止回放线程
         self._stop_playback()
+
+        # ③ 若正在连接中，终止连接工作线程（HAL open 可能重试数秒）
+        w = getattr(self, '_connect_worker', None)
+        if w is not None and w.isRunning():
+            w.quit()
+            if not w.wait(1500):
+                w.terminate()
+                w.wait(300)
+
+        # ④ 若录制保存线程还在写磁盘，最多等 3 秒
+        w2 = getattr(self, '_rec_stop_worker', None)
+        if w2 is not None and w2.isRunning():
+            w2.wait(3000)
+
+        # ⑤ 停止渲染线程
         self._stop_render()
-        self.camera.disconnect()
+
+        # ⑥ 断开相机（采集线程 daemon=True，join 超时后进程退出会自动回收）
+        try:
+            self.camera.disconnect()
+        except Exception:
+            pass
+
         super().closeEvent(event)
 
 

@@ -274,7 +274,7 @@ class CameraManager:
     def _do_stop(self):
         self._stop_flag.set()
         if self._capture_thr and self._capture_thr.is_alive():
-            self._capture_thr.join(timeout=6)
+            self._capture_thr.join(timeout=2)   # 采集线程 daemon=True，超时后进程退出自动回收
         self._capture_thr = None
 
     # ─────────────────────────────── 采集主循环 ─────────────────────────────
