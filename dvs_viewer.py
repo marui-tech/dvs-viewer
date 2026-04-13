@@ -199,6 +199,9 @@ class RenderThread(QThread):
         self._uloc_blit_tex   = -1
         self._last_vp = (-1, -1)   # 上次 u_vp 值，只在 resize 时才更新
 
+        # 回放模式：推送时原子清除 FBO，避免衰减造成的闪烁
+        self._do_clear  = False
+
         # GL 初始化完成标志（主线程可等待）
         self._gl_ready  = threading.Event()
 
@@ -218,6 +221,15 @@ class RenderThread(QThread):
         累积所有 USB 包到列表，渲染帧一次性消费全部，消除原有 95%+ 事件丢弃。"""
         with self._pending_lock:
             self._pending_list.append(evs)
+        self._new_evt.set()
+
+    def push_events_fresh(self, evs: np.ndarray):
+        """回放专用：先清除 FBO 再渲染，每个时间窗口独立显示，消除衰减闪烁。
+        即使 evs 为空也触发清除（显示当前时间窗口为空）。"""
+        with self._pending_lock:
+            self._do_clear = True
+            if len(evs) > 0:
+                self._pending_list.append(evs)
         self._new_evt.set()
 
     def clear_frame(self):
@@ -261,13 +273,17 @@ class RenderThread(QThread):
             _t_wait = time.monotonic()
             with self._pending_lock:
                 pending_list, self._pending_list = self._pending_list, []
+                do_clear, self._do_clear = self._do_clear, False
 
-            if not pending_list:
+            if not pending_list and not do_clear:
                 # 无新事件：等最多 1ms（timeBeginPeriod(1) 保证精度），做衰减帧
                 self._new_evt.wait(timeout=0.001)
                 self._new_evt.clear()
                 with self._pending_lock:
-                    pending_list, self._pending_list = self._pending_list, []
+                    pending_list2, self._pending_list = self._pending_list, []
+                    do_clear2, self._do_clear = self._do_clear, False
+                pending_list.extend(pending_list2)
+                do_clear = do_clear or do_clear2
             else:
                 self._new_evt.clear()
 
@@ -292,7 +308,7 @@ class RenderThread(QThread):
 
             # ② 计时：GPU渲染 + buffer swap
             _t_paint = time.monotonic()
-            n_evs = self._paint(evs, ww, wh)   # _paint 返回实际渲染事件数
+            n_evs = self._paint(evs, ww, wh, do_clear)   # _paint 返回实际渲染事件数
             self._ctx.swapBuffers(self._window)
             paint_ms = (time.monotonic() - _t_paint) * 1000.0
 
@@ -398,7 +414,7 @@ class RenderThread(QThread):
         self._fbo_size = (w, h)
 
     # ── 单帧渲染（仅在渲染线程调用）返回本帧实际渲染事件数 ─────────────────────
-    def _paint(self, evs, vw: int, vh: int) -> int:
+    def _paint(self, evs, vw: int, vh: int, do_clear: bool = False) -> int:
         if vw <= 0 or vh <= 0:
             return 0
 
@@ -426,16 +442,23 @@ class RenderThread(QThread):
         ri = self._read_idx
         wi = 1 - ri
 
-        # Decay pass → FBO_write
-        GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, self._fbos[wi])
-        GL.glViewport(0, 0, vw, vh)
-        GL.glUseProgram(self._prog_dec)
-        GL.glActiveTexture(GL.GL_TEXTURE0)
-        GL.glBindTexture(GL.GL_TEXTURE_2D, self._textures[ri])
-        GL.glUniform1f(self._uloc_dec_decay,
-                       1.0 if self.viz_mode == "accumulated" else self.decay_factor)
-        GL.glBindVertexArray(self._vao_quad)
-        GL.glDrawArrays(GL.GL_TRIANGLE_STRIP, 0, 4)
+        if do_clear:
+            # 回放模式：直接清除写缓冲，跳过衰减 pass
+            # 每个时间窗口独立渲染，消除高频衰减造成的闪烁
+            GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, self._fbos[wi])
+            GL.glViewport(0, 0, vw, vh)
+            GL.glClear(GL.GL_COLOR_BUFFER_BIT)
+        else:
+            # Decay pass → FBO_write
+            GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, self._fbos[wi])
+            GL.glViewport(0, 0, vw, vh)
+            GL.glUseProgram(self._prog_dec)
+            GL.glActiveTexture(GL.GL_TEXTURE0)
+            GL.glBindTexture(GL.GL_TEXTURE_2D, self._textures[ri])
+            GL.glUniform1f(self._uloc_dec_decay,
+                           1.0 if self.viz_mode == "accumulated" else self.decay_factor)
+            GL.glBindVertexArray(self._vao_quad)
+            GL.glDrawArrays(GL.GL_TRIANGLE_STRIP, 0, 4)
 
         # Event pass → FBO_write（letterbox 映射在着色器内完成）
         if n > 0:
@@ -543,6 +566,10 @@ class PlaybackThread(QThread):
         n           = len(evs)
         frame_s     = 1.0 / self.TARGET_FPS
 
+        # 回放期间：关闭衰减（accumulated），每帧独立清除+渲染
+        orig_viz = self._render_thr.viz_mode
+        self._render_thr.viz_mode = "accumulated"
+
         idx = 0
         while not self._stop_flag.is_set() and idx < n:
             self._pause_evt.wait()
@@ -562,8 +589,8 @@ class PlaybackThread(QThread):
             end_idx = min(end_idx, n)
 
             batch = evs[idx:end_idx]
-            if len(batch) > 0:
-                self._render_thr.push_events(batch)
+            # 每帧原子清除+渲染：消除高频衰减导致的闪烁
+            self._render_thr.push_events_fresh(batch)
 
             idx = end_idx
 
@@ -582,6 +609,8 @@ class PlaybackThread(QThread):
             if rem > 0:
                 time.sleep(rem)
 
+        # 恢复原始可视化模式
+        self._render_thr.viz_mode = orig_viz
         self.progress_updated.emit(1.0, "回放结束 Finished")
         self.finished.emit()
 
