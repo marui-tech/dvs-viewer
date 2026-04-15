@@ -1,6 +1,11 @@
 """
 DVS Camera — 渲染线程 + OpenGL 超低延迟可视化
 
+版本：见 __version__
+"""
+__version__ = "1.3.0"
+"""
+
 线程架构:
   Capture Thread  → push_events() → _pending (原子赋值, 无锁)
                                           ↓ threading.Event.set()
